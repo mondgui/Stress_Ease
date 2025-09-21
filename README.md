@@ -37,10 +37,9 @@ Base prefix for feature routes: /api
 ### Chat (/api/chat)
 - POST /message — send a message (creates session implicitly if session_id is null)
 - POST /summarize — generate session summary and cleanup
-- GET /sessions — list sessions
-- GET /sessions/<id> — session details
-- DELETE /sessions/<id> — remove a session
 - GET /crisis-resources — helplines and resources
+
+**Note:** Chat session listing, details, and deletion are handled directly by the Android app interacting with Firebase Firestore for better performance and real-time updates.
 
 ## Authentication
 All API endpoints require a Firebase ID Token in the Authorization header:
