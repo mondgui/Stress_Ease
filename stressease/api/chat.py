@@ -1,29 +1,65 @@
-"""Chat endpoints: sessions, messages, summaries, and crisis resources."""
+"""Chat endpoints: sessions and messages with local storage on Android."""
 
 from flask import Blueprint, request, jsonify
 from stressease.services.auth_service import token_required
-from stressease.services.firebase_service import (
-    get_chat_history, get_user_profile, save_chat_message,
-    create_chat_session, update_session_summary_and_title
-)
 from stressease.services.gemini_service import (
-    generate_chat_response, summarize_conversation, validate_gemini_response,
-    start_chat_session, generate_chat_title
+    generate_chat_response, validate_gemini_response,
+    start_chat_session
 )
 from datetime import datetime
+import uuid
+import re
 
 # Create the chat blueprint
 chat_bp = Blueprint('chat', __name__)
 
+#------------------------------------------------------------------------------
+# CRISIS SUPPORT ENDPOINT
+#------------------------------------------------------------------------------
+@chat_bp.route('/crisis-contacts', methods=['GET'])
+@token_required
+def get_crisis_contacts(user_id):
+    """
+    Endpoint for getting crisis support contact information.
+    Triggered when user clicks the "Help/Crisis Support" button in the app.
+    
+    Returns:
+        JSON response with crisis contact information
+    """
+    try:
+        return jsonify({
+            'success': True,
+            'message': 'Crisis support contacts retrieved successfully',
+            'contacts': CRISIS_CONTACTS
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': 'Failed to retrieve crisis contacts',
+            'message': str(e)
+        }), 500
 
-# ******************************************************************************
+#------------------------------------------------------------------------------
+# SHARED DATA STRUCTURES
+#------------------------------------------------------------------------------
+
+# Dictionary to store active chat sessions
+active_chat_sessions = {}
+
+# Dictionary to track if Crisis resources have been offered to a session
+crisis_resources_offered = {}
+
+#------------------------------------------------------------------------------
+# SECTION 1: CHAT SESSION MANAGEMENT
+#------------------------------------------------------------------------------
 # * POST /api/chat/message - Send message (creates session implicitly if needed)
 # ******************************************************************************
 @chat_bp.route('/message', methods=['POST'])
 @token_required
 def send_chat_message(user_id):
     """
-    Simplified endpoint for sending messages with implicit session creation.
+    Endpoint for sending messages with implicit session creation.
+    Chat history is stored locally on Android device.
     
     Expected JSON payload:
     {
@@ -32,12 +68,11 @@ def send_chat_message(user_id):
     }
     
     Returns:
-        JSON response with AI reply and session_id
+        JSON response with AI reply and session_id for local storage
     """
     try:
-        # Get JSON data from request
+        # Get and validate JSON data
         message_data = request.get_json()
-        
         if not message_data:
             return jsonify({
                 'success': False,
@@ -45,10 +80,11 @@ def send_chat_message(user_id):
                 'message': 'JSON data is required'
             }), 400
         
-        # Validate message
+        # Extract and validate message
         user_message = message_data.get('message', '').strip()
         session_id = message_data.get('session_id')
         
+        # Input validation - optimized with early returns
         if not user_message:
             return jsonify({
                 'success': False,
@@ -63,121 +99,283 @@ def send_chat_message(user_id):
                 'message': 'Message must be 1000 characters or less'
             }), 400
         
-        # Get user profile for context
-        user_profile = get_user_profile(user_id)
+        # Create timestamp once for efficiency
+        timestamp = datetime.utcnow().isoformat()
         
-        # Check if this is a new session (session_id is null/None)
-        if not session_id:
-            # IMPLICIT CREATE: First message in a new conversation
-            
-            # Create new session in Firestore
-            session_id = create_chat_session(user_id)
-            
-            if not session_id:
-                return jsonify({
-                    'success': False,
-                    'error': 'Session creation failed',
-                    'message': 'Unable to create new chat session'
-                }), 500
-            
-            # Start new ChatSession with Gemini (stateful conversation)
-            chat_session = start_chat_session(user_profile or {})
-            
-            if not chat_session:
-                return jsonify({
-                    'success': False,
-                    'error': 'AI session failed',
-                    'message': 'Unable to initialize AI conversation'
-                }), 500
-            
-            # Store the active session in memory cache
-            from stressease.services.gemini_service import active_chat_sessions
-            active_chat_sessions[session_id] = chat_session
-            
-        else:
-            # ONGOING CONVERSATION: Use existing session
-            from stressease.services.gemini_service import active_chat_sessions
-            
-            # Check if session exists in memory cache
-            if session_id not in active_chat_sessions:
-                return jsonify({
-                    'success': False,
-                    'error': 'Session not found',
-                    'message': 'Chat session has expired or does not exist'
-                }), 404
-            
-            chat_session = active_chat_sessions[session_id]
+        # Crisis detection - optimized to return tuple
+        is_crisis, crisis_category = detect_crisis_message(user_message)
         
-        # Generate AI response using the stateful ChatSession
+        # Handle crisis messages with optimized flow
+        if is_crisis and (not session_id or session_id not in crisis_resources_offered):
+            return _handle_crisis_message(user_message, session_id, timestamp, crisis_category)
+        
+        # Handle crisis confirmation responses
+        if session_id in crisis_resources_offered and not crisis_resources_offered[session_id]:
+            return _handle_crisis_confirmation(user_message, session_id, timestamp)
+        
+        # Handle regular chat messages - optimized session management
+        session_id, chat_session = _get_or_create_session(session_id)
+        if not chat_session:
+            return jsonify({
+                'success': False,
+                'error': 'Session not found',
+                'message': 'Chat session has expired or does not exist'
+            }), 404
+        
+        # Generate AI response with validation
         ai_response = generate_chat_response(chat_session, user_message)
         
-        if not ai_response:
-            return jsonify({
-                'success': False,
-                'error': 'AI response failed',
-                'message': 'Unable to generate response at this time. Please try again.'
-            }), 500
-        
-        # Validate AI response for safety
+        # Validate AI response
         if not validate_gemini_response(ai_response):
-            ai_response = "I understand you're going through a difficult time. Please consider reaching out to a mental health professional or crisis helpline for immediate support."
+            ai_response = "I apologize, but I'm having trouble generating a proper response right now. Could you please rephrase your message?"
         
-        # Save user message to Firestore
-        user_message_data = {
-            'role': 'user',
-            'content': user_message,
-            'timestamp': datetime.utcnow()
-        }
-        
-        success_user = save_chat_message(user_id, session_id, user_message_data)
-        
-        if not success_user:
-            return jsonify({
-                'success': False,
-                'error': 'Database error',
-                'message': 'Failed to save user message'
-            }), 500
-        
-        # Save AI response to Firestore
-        ai_message_data = {
-            'role': 'assistant',
-            'content': ai_response,
-            'timestamp': datetime.utcnow()
-        }
-        
-        success_ai = save_chat_message(user_id, session_id, ai_message_data)
-        
-        if not success_ai:
-            return jsonify({
-                'success': False,
-                'error': 'Database error',
-                'message': 'Failed to save AI response'
-            }), 500
-        
-        # Return response with both reply and session_id
+        # Return optimized response structure
         return jsonify({
             'success': True,
-            'reply': ai_response,
-            'session_id': session_id,
-            'timestamp': ai_message_data['timestamp'].isoformat()
+            'user_message': {
+                'content': user_message,
+                'timestamp': timestamp,
+                'role': 'user'
+            },
+            'ai_response': {
+                'content': ai_response,
+                'timestamp': timestamp,
+                'role': 'assistant'
+            },
+            'session_id': session_id
         }), 201
         
     except Exception as e:
         return jsonify({
             'success': False,
-            'error': 'Server error',
+            'error': 'Failed to process message',
             'message': str(e)
         }), 500
 
 
-# ******************************************************************************
-# * POST /api/chat/summarize - Generate session summary and cleanup
-# ******************************************************************************
-@chat_bp.route('/summarize', methods=['POST'])
-@token_required
-def summarize_chat_session(user_id):
+def _handle_crisis_message(user_message, session_id, timestamp, crisis_category):
     """
-    Simplified endpoint for generating session summary and title at conversation end.
+    Optimized helper function to handle Crisis messages.
+    
+    Args:
+        user_message (str): The user's message
+        session_id (str): Session ID or None
+        timestamp (str): ISO timestamp
+        crisis_category (str): Type of crisis detected
+        
+    Returns:
+        Flask response for Crisis message
+    """
+    # Generate crisis-specific response
+    ai_response = generate_crisis_response(user_message)
+    
+    # Get or create session
+    session_id, chat_session = _get_or_create_session(session_id)
+    if not chat_session:
+        return jsonify({
+            'success': False,
+            'error': 'Session creation failed',
+            'message': 'Unable to create chat session'
+        }), 500
+    
+    # Mark crisis detection but not resources offered yet
+    crisis_resources_offered[session_id] = False
+    
+    return jsonify({
+        'success': True,
+        'user_message': {
+            'content': user_message,
+            'timestamp': timestamp,
+            'role': 'user'
+        },
+        'ai_response': {
+            'content': ai_response,
+            'timestamp': timestamp,
+            'role': 'assistant'
+        },
+        'session_id': session_id,
+        'crisis_detected': True,
+        'crisis_category': crisis_category,
+        'confirmation_required': True,
+        'confirmation_message': "Would you like emergency contact information?"
+    }), 201
+
+
+def _handle_crisis_confirmation(user_message, session_id, timestamp):
+    """
+    Optimized helper function to handle Crisis confirmation responses.
+    
+    Args:
+        user_message (str): The user's response
+        session_id (str): Session ID
+        timestamp (str): ISO timestamp
+        
+    Returns:
+        Flask response for Crisis confirmation
+    """
+    # Optimized pattern matching for yes/no responses
+    positive_patterns = r'\b(yes|sure|okay|ok|please|help|need)\b'
+    negative_patterns = r'\b(no|not|don\'t|dont|later|maybe)\b'
+    
+    user_lower = user_message.lower()
+    
+    if re.search(positive_patterns, user_lower):
+        ai_response = "I'm glad you're open to resources. Here are some contacts that can provide immediate support."
+        crisis_resources_offered[session_id] = True
+        
+        # Use the direct contact information stored in the file
+        crisis_resources = CRISIS_CONTACTS
+        
+        return jsonify({
+            'success': True,
+            'user_message': {
+                'content': user_message,
+                'timestamp': timestamp,
+                'role': 'user'
+            },
+            'ai_response': {
+                'content': ai_response,
+                'timestamp': timestamp,
+                'role': 'assistant'
+            },
+            'session_id': session_id,
+             'crisis_detected': True,
+             'show_resources': True,
+             'crisis_resources': crisis_resources
+        }), 201
+        
+    elif re.search(negative_patterns, user_lower):
+        ai_response = "I understand you may not want resources right now, but I care about your wellbeing. Here are the support contacts in case you need them later."
+        crisis_resources_offered[session_id] = True
+        
+        # Use the direct contact information stored in the file
+        crisis_resources = CRISIS_CONTACTS
+        
+        return jsonify({
+            'success': True,
+            'user_message': {
+                'content': user_message,
+                'timestamp': timestamp,
+                'role': 'user'
+            },
+            'ai_response': {
+                'content': ai_response,
+                'timestamp': timestamp,
+                'role': 'assistant'
+            },
+            'session_id': session_id,
+            'crisis_detected': True,
+            'show_resources': True,
+            'crisis_resources': crisis_resources
+        }), 201
+    
+    # If response is unclear, ask for clarification
+    ai_response = "I want to make sure I understand - would you like me to share some emergency contact information that might be helpful?"
+    
+    return jsonify({
+        'success': True,
+        'user_message': {
+            'content': user_message,
+            'timestamp': timestamp,
+            'role': 'user'
+        },
+        'ai_response': {
+            'content': ai_response,
+            'timestamp': timestamp,
+            'role': 'assistant'
+        },
+        'session_id': session_id,
+        'crisis_detected': True,
+        'confirmation_required': True,
+        'confirmation_message': "Please respond with 'yes' or 'no'"
+    }), 201
+
+
+def _get_or_create_session(session_id):
+    """
+    Optimized helper function to get existing session or create new one.
+    
+    Args:
+        session_id (str): Session ID or None
+        
+    Returns:
+        tuple: (session_id, chat_session) or (None, None) if failed
+    """
+    try:
+        if not session_id:
+            # Create new session
+            session_id = str(uuid.uuid4())
+            chat_session = start_chat_session({})
+            active_chat_sessions[session_id] = chat_session
+            return session_id, chat_session
+        
+        # Check if session exists
+        if session_id in active_chat_sessions:
+            return session_id, active_chat_sessions[session_id]
+        
+        # Session not found
+        return None, None
+        
+    except Exception:
+        return None, None
+
+
+def _format_crisis_resources(crisis_contacts):
+    """
+    Convert database crisis contacts to expected API format.
+    
+    Args:
+        crisis_contacts (list): List of crisis contacts from database
+        
+    Returns:
+        dict: Formatted crisis resources
+    """
+    formatted = {
+        'emergency_services': {},
+        'crisis_hotlines': [],
+        'online_resources': []
+    }
+    
+    for contact in crisis_contacts:
+        contact_type = contact.get('type', 'online_resource')
+        
+        if contact_type == 'emergency':
+            formatted['emergency_services'] = {
+                'number': contact.get('number'),
+                'description': contact.get('description')
+            }
+        elif contact_type == 'crisis_hotline':
+            hotline = {
+                'name': contact.get('name'),
+                'number': contact.get('number'),
+                'description': contact.get('description')
+            }
+            if contact.get('website'):
+                hotline['website'] = contact.get('website')
+            formatted['crisis_hotlines'].append(hotline)
+        else:
+            resource = {
+                'name': contact.get('name'),
+                'description': contact.get('description')
+            }
+            if contact.get('website'):
+                resource['website'] = contact.get('website')
+            formatted['online_resources'].append(resource)
+    
+    return formatted
+
+#------------------------------------------------------------------------------
+# SECTION 2: END MESSAGE RELATED CODE
+#------------------------------------------------------------------------------
+# ******************************************************************************
+# * POST /api/chat/end-session - End chat session and cleanup server resources
+# ******************************************************************************
+@chat_bp.route('/end-session', methods=['POST'])
+@token_required
+def end_chat_session(user_id):
+    """
+    Optimized endpoint to end a chat session and clean up server-side resources.
+    The complete chat history is stored locally on the Android device.
     
     Expected JSON payload:
     {
@@ -185,7 +383,72 @@ def summarize_chat_session(user_id):
     }
     
     Returns:
-        JSON response with generated title and summary
+        JSON response confirming session cleanup
+    """
+    try:
+        # Get and validate JSON data
+        request_data = request.get_json()
+        if not request_data:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid request',
+                'message': 'JSON data is required'
+            }), 400
+        
+        # Extract and validate session_id
+        session_id = request_data.get('session_id', '').strip()
+        if not session_id:
+            return jsonify({
+                'success': False,
+                'error': 'Missing session_id',
+                'message': 'session_id is required'
+            }), 400
+        
+        # Optimized cleanup - batch operations
+        cleanup_count = 0
+        
+        # Clean up active session from memory cache
+        if session_id in active_chat_sessions:
+            del active_chat_sessions[session_id]
+            cleanup_count += 1
+            
+        # Clean up crisis resources tracking
+        if session_id in crisis_resources_offered:
+            del Crisis_resources_offered[session_id]
+            cleanup_count += 1
+            
+        return jsonify({
+            'success': True,
+            'message': 'Session ended successfully',
+            'cleanup_count': cleanup_count
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': 'Failed to end session',
+            'message': str(e)
+        }), 500
+
+
+# ******************************************************************************
+# * POST /api/chat/crisis-response - Handle crisis messages with confirmation
+# ******************************************************************************
+@chat_bp.route('/crisis-response', methods=['POST'])
+@token_required
+def handle_crisis_response(user_id):
+    """
+    Handle crisis messages with appropriate responses and resources.
+    
+    Expected JSON payload:
+    {
+        "message": "I want to die",
+        "session_id": "a1b2c3d4-e5f6-g7h8-i9j0-k1l2m3n4o5p6",
+        "confirmation_response": null  // null for initial message, "yes"/"no" for confirmation
+    }
+    
+    Returns:
+        JSON response with AI reply, Crisis resources, and confirmation request
     """
     try:
         # Get JSON data from request
@@ -198,72 +461,74 @@ def summarize_chat_session(user_id):
                 'message': 'JSON data is required'
             }), 400
         
+        # Extract message and session data
+        user_message = request_data.get('message', '').strip()
         session_id = request_data.get('session_id')
+        confirmation_response = request_data.get('confirmation_response')
         
         if not session_id:
             return jsonify({
                 'success': False,
-                'error': 'Missing session_id',
-                'message': 'session_id is required'
+                'error': 'Invalid session',
+                'message': 'Session ID is required'
             }), 400
         
-        # Retrieve chat session from Firestore
-        session_data = get_chat_history(user_id, session_id)
-        
-        if not session_data:
+        # Check if this is a confirmation response
+        if confirmation_response is not None:
+            # User has responded to the confirmation request
+            timestamp = datetime.utcnow().isoformat()
+            
+            if confirmation_response.lower() == 'yes':
+                ai_response = "I'm glad you're open to resources. Here are some contacts that can provide immediate support."
+            else:
+                ai_response = "I understand you may not want resources right now, but I care about your wellbeing. I'm sharing some contacts that might be helpful when you're ready."
+            
+            # Mark that resources have been provided for this session
+            crisis_resources_offered[session_id] = True
+            
             return jsonify({
-                'success': False,
-                'error': 'Session not found',
-                'message': 'Chat session not found or access denied'
-            }), 404
+                'success': True,
+                'user_message': {
+                    'content': confirmation_response,
+                    'timestamp': timestamp,
+                    'role': 'user'
+                },
+                'ai_response': {
+                    'content': ai_response,
+                    'timestamp': timestamp,
+                    'role': 'assistant'
+                },
+                'session_id': session_id,
+                'crisis_detected': True,
+                'show_resources': True,
+                'crisis_resources': INDIA_CRISIS_RESOURCES
+            }), 200
         
-        # Check if session has enough messages to summarize
-        messages = session_data.get('messages', [])
+        # This is an initial Crisis message
+        # Generate an appropriate AI response for the Crisis message
+        ai_response = generate_crisis_response(user_message)
         
-        if len(messages) < 4:  # Need at least 4 messages (2 exchanges)
-            return jsonify({
-                'success': False,
-                'error': 'Insufficient messages',
-                'message': 'Session needs more messages to generate a meaningful summary'
-            }), 400
+        # Mark that we've offered resources for this session
+        crisis_resources_offered[session_id] = True
         
-        # Create transcript for AI processing
-        transcript = "\n".join([
-            f"{msg['role'].title()}: {msg['content']}"
-            for msg in messages
-        ])
-        
-        # Generate title and summary using Gemini AI
-        title = generate_chat_title(transcript)
-        summary = summarize_conversation(transcript)
-        
-        if not title or not summary:
-            return jsonify({
-                'success': False,
-                'error': 'AI processing failed',
-                'message': 'Unable to generate title and summary at this time'
-            }), 500
-        
-        # Update session in Firestore with title, summary, and completion status
-        success = update_session_summary_and_title(session_id, title, summary)
-        
-        if not success:
-            return jsonify({
-                'success': False,
-                'error': 'Database error',
-                'message': 'Failed to save session summary'
-            }), 500
-        
-        # Clean up active session from memory cache
-        from stressease.services.gemini_service import active_chat_sessions
-        if session_id in active_chat_sessions:
-            del active_chat_sessions[session_id]
+        timestamp = datetime.utcnow().isoformat()
         
         return jsonify({
             'success': True,
-            'title': title,
-            'summary': summary,
-            'message': 'Session summarized and completed successfully'
+            'user_message': {
+                'content': user_message,
+                'timestamp': timestamp,
+                'role': 'user'
+            },
+            'ai_response': {
+                'content': ai_response,
+                'timestamp': timestamp,
+                'role': 'assistant'
+            },
+            'session_id': session_id,
+            'crisis_detected': True,
+            'confirmation_required': True,
+            'confirmation_message': "Would you like emergency contact information?"
         }), 200
         
     except Exception as e:
@@ -274,81 +539,179 @@ def summarize_chat_session(user_id):
         }), 500
 
 
-# Session management endpoints removed - Android app handles these directly with Firebase
-# The app can query Firestore directly for better performance and real-time updates
 
 
-# ******************************************************************************
-# * GET /api/chat/crisis-resources - Get mental health helplines and resources
-# ******************************************************************************
-@chat_bp.route('/crisis-resources', methods=['GET'])
-@token_required
-def get_crisis_resources(user_id):
-    """
-    Get crisis support resources and emergency contacts.
+
+#------------------------------------------------------------------------------
+# SECTION 3: CRISIS SUPPORT RELATED CODE
+#------------------------------------------------------------------------------
+
+# Crisis detection keywords - grouped by category for better maintainability
+CRISIS_KEYWORDS = {
+    'suicide': [r'\bsuicide\b', r'\bkill myself\b', r'\bend my life\b', r'\bwant to die\b'],
+    'self_harm': [r'\bharming myself\b', r'\bself-harm\b', r'\bself harm\b', r'\bhurt myself\b'],
+    'general': [r'\bemergency\b', r'\bhelp me\b', r'\bhopeless\b', r'\bno reason to live\b',
+               r'\bcan\'t go on\b', r'\bwant to end it\b', r'\bgive up\b']
+}
+
+# India-specific Crisis resources
+INDIA_CRISIS_RESOURCES = {
+    'emergency_services': {
+        'number': '112',
+        'description': 'National Emergency Number for immediate emergencies'
+    },
+    'crisis_hotlines': [
+        {
+            'name': 'AASRA',
+            'number': '91-9820466726',
+            'description': '24/7 crisis support and suicide prevention',
+            'website': 'http://www.aasra.info/'
+        },
+        {
+            'name': 'Vandrevala Foundation',
+            'number': '1860-2662-345 / 1800-2333-330',
+            'description': '24/7 helpline for mental health emergencies',
+            'website': 'https://www.vandrevalafoundation.com/'
+        },
+        {
+            'name': 'NIMHANS Psychosocial Support Helpline',
+            'number': '080-46110007',
+            'description': 'Mental health support and counseling',
+            'website': 'https://nimhans.ac.in/'
+        },
+        {
+            'name': 'iCall Helpline',
+            'number': '022-25521111',
+            'description': 'Psychosocial helpline (Mon-Sat, 8 AM to 10 PM)',
+            'website': 'https://icallhelpline.org/'
+        }
+    ],
+    'online_resources': [
+        {
+            'name': 'The Live Love Laugh Foundation',
+            'website': 'https://www.thelivelovelaughfoundation.org/',
+            'description': 'Mental health resources and support'
+        },
+        {
+            'name': 'YourDost',
+            'website': 'https://yourdost.com/',
+            'description': 'Online counseling and emotional wellness platform'
+        }
+    ]
+}
+
+# Crisis response templates - centralized for easier maintenance
+CRISIS_RESPONSES = {
+    'suicide': ("I'm deeply concerned about what you're sharing. Your life matters, and these feelings, " 
+               "while overwhelming, can be addressed with proper support. Please know that help is available, " 
+               "and many people have overcome similar feelings with professional assistance. " 
+               "Would you be willing to reach out to a Crisis helpline right now?"),
     
-    Returns:
-        JSON response with crisis resources
+    'self_harm': ("I understand you're in a lot of pain right now. Self-harm is often a way to cope with " 
+                 "emotional distress, but there are healthier alternatives that can help. Professional support " 
+                 "can provide immediate relief and long-term strategies. Your wellbeing matters, and " 
+                 "recovery is possible with the right help."),
+    
+    'general': ("I'm concerned about what you're sharing and want you to know that support is available. " 
+               "While I'm here to listen, connecting with mental health professionals can provide the " 
+               "specialized help you deserve. You don't have to face these feelings alone, and " 
+               "reaching out is a sign of strength, not weakness.")
+}
+
+def detect_crisis_message(message):
     """
-    try:
-        # Get user's emergency contact if available
-        user_profile = get_user_profile(user_id)
-        emergency_contact = user_profile.get('emergency_contact') if user_profile else None
+    Detect if a message contains Crisis-related keywords.
+    
+    Args:
+        message (str): The user message to check
         
-        # Standard crisis resources
-        crisis_resources = {
-            'emergency_services': {
-                'number': '911',
-                'description': 'For immediate life-threatening emergencies'
-            },
-            'crisis_hotlines': [
-                {
-                    'name': 'National Suicide Prevention Lifeline',
-                    'number': '988',
-                    'description': '24/7 crisis support',
-                    'website': 'https://suicidepreventionlifeline.org'
-                },
-                {
-                    'name': 'Crisis Text Line',
-                    'number': 'Text HOME to 741741',
-                    'description': '24/7 text-based crisis support',
-                    'website': 'https://www.crisistextline.org'
-                },
-                {
-                    'name': 'SAMHSA National Helpline',
-                    'number': '1-800-662-4357',
-                    'description': 'Treatment referral and information service',
-                    'website': 'https://www.samhsa.gov/find-help/national-helpline'
-                }
-            ],
-            'online_resources': [
-                {
-                    'name': 'Mental Health America',
-                    'website': 'https://www.mhanational.org',
-                    'description': 'Mental health resources and screening tools'
-                },
-                {
-                    'name': 'National Alliance on Mental Illness (NAMI)',
-                    'website': 'https://www.nami.org',
-                    'description': 'Support groups and educational resources'
-                }
-            ]
-        }
+    Returns:
+        tuple: (bool, str) - (is_crisis, category)
+    """
+    message = message.lower()
+    
+    # Check each category of keywords
+    for category, patterns in CRISIS_KEYWORDS.items():
+        for pattern in patterns:
+            if re.search(pattern, message):
+                return True, category
+    
+    return False, None
+
+def generate_crisis_response(message):
+    """
+    Generate a supportive response for Crisis messages.
+    
+    Args:
+        message (str): The user's crisis message
         
-        response_data = {
-            'success': True,
-            'crisis_resources': crisis_resources
-        }
-        
-        # Include user's emergency contact if available
-        if emergency_contact:
-            response_data['personal_emergency_contact'] = emergency_contact
-        
-        return jsonify(response_data), 200
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': 'Failed to retrieve Crisis resources',
-            'message': str(e)
-        }), 500
+    Returns:
+        str: A supportive response
+    """
+    # Detect the specific Crisis category
+    is_crisis, category = detect_crisis_message(message)
+    
+    if not is_crisis:
+        return CRISIS_RESPONSES['general']
+    
+    # Return the appropriate response based on the category
+    return CRISIS_RESPONSES.get(category, CRISIS_RESPONSES['general'])
+
+
+# Crisis contact information stored directly in the file
+CRISIS_CONTACTS = [
+    {
+        'id': 'emergency_112',
+        'type': 'emergency',
+        'name': 'National Emergency Number',
+        'number': '112',
+        'description': 'National Emergency Number for immediate emergencies',
+        'availability': '24/7',
+        'country': 'India',
+        'priority': 1
+    },
+    {
+        'id': 'aasra',
+        'type': 'crisis_hotline',
+        'name': 'AASRA',
+        'number': '91-9820466726',
+        'description': '24/7 crisis support and suicide prevention',
+        'website': 'http://www.aasra.info/',
+        'availability': '24/7',
+        'country': 'India',
+        'priority': 2
+    },
+    {
+        'id': 'vandrevala',
+        'type': 'crisis_hotline',
+        'name': 'Vandrevala Foundation',
+        'number': '1860-2662-345 / 1800-2333-330',
+        'description': '24/7 helpline for mental health emergencies',
+        'website': 'https://www.vandrevalafoundation.com/',
+        'availability': '24/7',
+        'country': 'India',
+        'priority': 3
+    },
+    {
+        'id': 'nimhans',
+        'type': 'crisis_hotline',
+        'name': 'NIMHANS Psychosocial Support Helpline',
+        'number': '080-46110007',
+        'description': 'Mental health support and counseling',
+        'website': 'https://nimhans.ac.in/',
+        'availability': 'Business hours',
+        'country': 'India',
+        'priority': 4
+    },
+    {
+        'id': 'icall',
+        'type': 'crisis_hotline',
+        'name': 'iCall Helpline',
+        'number': '022-25521111',
+        'description': 'Psychosocial helpline (Mon-Sat, 8 AM to 10 PM)',
+        'website': 'https://icallhelpline.org/',
+        'availability': 'Mon-Sat, 8 AM to 10 PM',
+        'country': 'India',
+        'priority': 5
+    }
+]

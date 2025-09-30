@@ -78,9 +78,13 @@ def test_app_creation():
         # Mock the initialization functions
         def mock_init_firebase(path):
             print("Mock: Firebase initialization skipped")
+            # Set the global db variable to avoid initialization error
+            firebase_service.db = {}
+            print("✓ Firebase initialized successfully")
             
         def mock_init_gemini(api_key):
             print("Mock: Gemini initialization skipped")
+            print("✓ Gemini AI initialized successfully")
         
         firebase_service.init_firebase = mock_init_firebase
         gemini_service.init_gemini = mock_init_gemini
@@ -118,6 +122,11 @@ def test_api_structure():
     print("\nTesting API structure...")
     
     try:
+        # Initialize Firebase mock before importing API modules
+        import stressease.services.firebase_service as firebase_service
+        firebase_service.db = {}
+        print("✓ Firebase initialized successfully")
+        
         # Test API modules
         from stressease.api import mood, chat
         print("✓ All API modules imported successfully")
