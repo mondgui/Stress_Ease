@@ -39,21 +39,14 @@ def get_crisis_contacts(user_id):
             'message': str(e)
         }), 500
 
-#------------------------------------------------------------------------------
-# SHARED DATA STRUCTURES
-#------------------------------------------------------------------------------
 
 # Dictionary to store active chat sessions
 active_chat_sessions = {}
 
-# Dictionary to track if Crisis resources have been offered to a session
-crisis_resources_offered = {}
 
+# Endpoint: POST /api/chat/message
+# Purpose:  Send message and create session implicitly if needed
 #------------------------------------------------------------------------------
-# SECTION 1: CHAT SESSION MANAGEMENT
-#------------------------------------------------------------------------------
-# * POST /api/chat/message - Send message (creates session implicitly if needed)
-# ******************************************************************************
 @chat_bp.route('/message', methods=['POST'])
 @token_required
 def send_chat_message(user_id):
@@ -102,18 +95,10 @@ def send_chat_message(user_id):
         # Create timestamp once for efficiency
         timestamp = datetime.utcnow().isoformat()
         
-        # Crisis detection - optimized to return tuple
+        # Simple crisis detection - returns tuple (is_crisis, category)
         is_crisis, crisis_category = detect_crisis_message(user_message)
         
-        # Handle crisis messages with optimized flow
-        if is_crisis and (not session_id or session_id not in crisis_resources_offered):
-            return _handle_crisis_message(user_message, session_id, timestamp, crisis_category)
-        
-        # Handle crisis confirmation responses
-        if session_id in crisis_resources_offered and not crisis_resources_offered[session_id]:
-            return _handle_crisis_confirmation(user_message, session_id, timestamp)
-        
-        # Handle regular chat messages - optimized session management
+        # Get or create session
         session_id, chat_session = _get_or_create_session(session_id)
         if not chat_session:
             return jsonify({
@@ -122,28 +107,52 @@ def send_chat_message(user_id):
                 'message': 'Chat session has expired or does not exist'
             }), 404
         
-        # Generate AI response with validation
-        ai_response = generate_chat_response(chat_session, user_message)
-        
-        # Validate AI response
-        if not validate_gemini_response(ai_response):
-            ai_response = "I apologize, but I'm having trouble generating a proper response right now. Could you please rephrase your message?"
-        
-        # Return optimized response structure
-        return jsonify({
-            'success': True,
-            'user_message': {
-                'content': user_message,
-                'timestamp': timestamp,
-                'role': 'user'
-            },
-            'ai_response': {
-                'content': ai_response,
-                'timestamp': timestamp,
-                'role': 'assistant'
-            },
-            'session_id': session_id
-        }), 201
+        # Generate appropriate response based on crisis detection
+        if is_crisis:
+            # Generate compassionate crisis response
+            ai_response = generate_crisis_response(user_message)
+            
+            # Return response with crisis contacts
+            return jsonify({
+                'success': True,
+                'user_message': {
+                    'content': user_message,
+                    'timestamp': timestamp,
+                    'role': 'user'
+                },
+                'ai_response': {
+                    'content': ai_response,
+                    'timestamp': timestamp,
+                    'role': 'assistant'
+                },
+                'session_id': session_id,
+                'crisis_detected': True,
+                'crisis_category': crisis_category,
+                'crisis_resources': CRISIS_CONTACTS
+            }), 201
+        else:
+            # Generate normal AI response with validation
+            ai_response = generate_chat_response(chat_session, user_message)
+            
+            # Validate AI response
+            if not validate_gemini_response(ai_response):
+                ai_response = "I apologize, but I'm having trouble generating a proper response right now. Could you please rephrase your message?"
+            
+            # Return standard response structure
+            return jsonify({
+                'success': True,
+                'user_message': {
+                    'content': user_message,
+                    'timestamp': timestamp,
+                    'role': 'user'
+                },
+                'ai_response': {
+                    'content': ai_response,
+                    'timestamp': timestamp,
+                    'role': 'assistant'
+                },
+                'session_id': session_id
+            }), 201
         
     except Exception as e:
         return jsonify({
@@ -151,144 +160,6 @@ def send_chat_message(user_id):
             'error': 'Failed to process message',
             'message': str(e)
         }), 500
-
-
-def _handle_crisis_message(user_message, session_id, timestamp, crisis_category):
-    """
-    Optimized helper function to handle Crisis messages.
-    
-    Args:
-        user_message (str): The user's message
-        session_id (str): Session ID or None
-        timestamp (str): ISO timestamp
-        crisis_category (str): Type of crisis detected
-        
-    Returns:
-        Flask response for Crisis message
-    """
-    # Generate crisis-specific response
-    ai_response = generate_crisis_response(user_message)
-    
-    # Get or create session
-    session_id, chat_session = _get_or_create_session(session_id)
-    if not chat_session:
-        return jsonify({
-            'success': False,
-            'error': 'Session creation failed',
-            'message': 'Unable to create chat session'
-        }), 500
-    
-    # Mark crisis detection but not resources offered yet
-    crisis_resources_offered[session_id] = False
-    
-    return jsonify({
-        'success': True,
-        'user_message': {
-            'content': user_message,
-            'timestamp': timestamp,
-            'role': 'user'
-        },
-        'ai_response': {
-            'content': ai_response,
-            'timestamp': timestamp,
-            'role': 'assistant'
-        },
-        'session_id': session_id,
-        'crisis_detected': True,
-        'crisis_category': crisis_category,
-        'confirmation_required': True,
-        'confirmation_message': "Would you like emergency contact information?"
-    }), 201
-
-
-def _handle_crisis_confirmation(user_message, session_id, timestamp):
-    """
-    Optimized helper function to handle Crisis confirmation responses.
-    
-    Args:
-        user_message (str): The user's response
-        session_id (str): Session ID
-        timestamp (str): ISO timestamp
-        
-    Returns:
-        Flask response for Crisis confirmation
-    """
-    # Optimized pattern matching for yes/no responses
-    positive_patterns = r'\b(yes|sure|okay|ok|please|help|need)\b'
-    negative_patterns = r'\b(no|not|don\'t|dont|later|maybe)\b'
-    
-    user_lower = user_message.lower()
-    
-    if re.search(positive_patterns, user_lower):
-        ai_response = "I'm glad you're open to resources. Here are some contacts that can provide immediate support."
-        crisis_resources_offered[session_id] = True
-        
-        # Use the direct contact information stored in the file
-        crisis_resources = CRISIS_CONTACTS
-        
-        return jsonify({
-            'success': True,
-            'user_message': {
-                'content': user_message,
-                'timestamp': timestamp,
-                'role': 'user'
-            },
-            'ai_response': {
-                'content': ai_response,
-                'timestamp': timestamp,
-                'role': 'assistant'
-            },
-            'session_id': session_id,
-             'crisis_detected': True,
-             'show_resources': True,
-             'crisis_resources': crisis_resources
-        }), 201
-        
-    elif re.search(negative_patterns, user_lower):
-        ai_response = "I understand you may not want resources right now, but I care about your wellbeing. Here are the support contacts in case you need them later."
-        crisis_resources_offered[session_id] = True
-        
-        # Use the direct contact information stored in the file
-        crisis_resources = CRISIS_CONTACTS
-        
-        return jsonify({
-            'success': True,
-            'user_message': {
-                'content': user_message,
-                'timestamp': timestamp,
-                'role': 'user'
-            },
-            'ai_response': {
-                'content': ai_response,
-                'timestamp': timestamp,
-                'role': 'assistant'
-            },
-            'session_id': session_id,
-            'crisis_detected': True,
-            'show_resources': True,
-            'crisis_resources': crisis_resources
-        }), 201
-    
-    # If response is unclear, ask for clarification
-    ai_response = "I want to make sure I understand - would you like me to share some emergency contact information that might be helpful?"
-    
-    return jsonify({
-        'success': True,
-        'user_message': {
-            'content': user_message,
-            'timestamp': timestamp,
-            'role': 'user'
-        },
-        'ai_response': {
-            'content': ai_response,
-            'timestamp': timestamp,
-            'role': 'assistant'
-        },
-        'session_id': session_id,
-        'crisis_detected': True,
-        'confirmation_required': True,
-        'confirmation_message': "Please respond with 'yes' or 'no'"
-    }), 201
 
 
 def _get_or_create_session(session_id):
@@ -364,12 +235,11 @@ def _format_crisis_resources(crisis_contacts):
     
     return formatted
 
-#------------------------------------------------------------------------------
-# SECTION 2: END MESSAGE RELATED CODE
-#------------------------------------------------------------------------------
-# ******************************************************************************
-# * POST /api/chat/end-session - End chat session and cleanup server resources
-# ******************************************************************************
+
+
+
+# Endpoint: POST /api/chat/end-session
+# Purpose:  End chat session and cleanup server resources
 @chat_bp.route('/end-session', methods=['POST'])
 @token_required
 def end_chat_session(user_id):
@@ -412,10 +282,7 @@ def end_chat_session(user_id):
             del active_chat_sessions[session_id]
             cleanup_count += 1
             
-        # Clean up crisis resources tracking
-        if session_id in crisis_resources_offered:
-            del Crisis_resources_offered[session_id]
-            cleanup_count += 1
+        # No need to clean up crisis resources tracking anymore
             
         return jsonify({
             'success': True,
@@ -431,119 +298,10 @@ def end_chat_session(user_id):
         }), 500
 
 
-# ******************************************************************************
-# * POST /api/chat/crisis-response - Handle crisis messages with confirmation
-# ******************************************************************************
-@chat_bp.route('/crisis-response', methods=['POST'])
-@token_required
-def handle_crisis_response(user_id):
-    """
-    Handle crisis messages with appropriate responses and resources.
-    
-    Expected JSON payload:
-    {
-        "message": "I want to die",
-        "session_id": "a1b2c3d4-e5f6-g7h8-i9j0-k1l2m3n4o5p6",
-        "confirmation_response": null  // null for initial message, "yes"/"no" for confirmation
-    }
-    
-    Returns:
-        JSON response with AI reply, Crisis resources, and confirmation request
-    """
-    try:
-        # Get JSON data from request
-        request_data = request.get_json()
-        
-        if not request_data:
-            return jsonify({
-                'success': False,
-                'error': 'Invalid request',
-                'message': 'JSON data is required'
-            }), 400
-        
-        # Extract message and session data
-        user_message = request_data.get('message', '').strip()
-        session_id = request_data.get('session_id')
-        confirmation_response = request_data.get('confirmation_response')
-        
-        if not session_id:
-            return jsonify({
-                'success': False,
-                'error': 'Invalid session',
-                'message': 'Session ID is required'
-            }), 400
-        
-        # Check if this is a confirmation response
-        if confirmation_response is not None:
-            # User has responded to the confirmation request
-            timestamp = datetime.utcnow().isoformat()
-            
-            if confirmation_response.lower() == 'yes':
-                ai_response = "I'm glad you're open to resources. Here are some contacts that can provide immediate support."
-            else:
-                ai_response = "I understand you may not want resources right now, but I care about your wellbeing. I'm sharing some contacts that might be helpful when you're ready."
-            
-            # Mark that resources have been provided for this session
-            crisis_resources_offered[session_id] = True
-            
-            return jsonify({
-                'success': True,
-                'user_message': {
-                    'content': confirmation_response,
-                    'timestamp': timestamp,
-                    'role': 'user'
-                },
-                'ai_response': {
-                    'content': ai_response,
-                    'timestamp': timestamp,
-                    'role': 'assistant'
-                },
-                'session_id': session_id,
-                'crisis_detected': True,
-                'show_resources': True,
-                'crisis_resources': INDIA_CRISIS_RESOURCES
-            }), 200
-        
-        # This is an initial Crisis message
-        # Generate an appropriate AI response for the Crisis message
-        ai_response = generate_crisis_response(user_message)
-        
-        # Mark that we've offered resources for this session
-        crisis_resources_offered[session_id] = True
-        
-        timestamp = datetime.utcnow().isoformat()
-        
-        return jsonify({
-            'success': True,
-            'user_message': {
-                'content': user_message,
-                'timestamp': timestamp,
-                'role': 'user'
-            },
-            'ai_response': {
-                'content': ai_response,
-                'timestamp': timestamp,
-                'role': 'assistant'
-            },
-            'session_id': session_id,
-            'crisis_detected': True,
-            'confirmation_required': True,
-            'confirmation_message': "Would you like emergency contact information?"
-        }), 200
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': 'Server error',
-            'message': str(e)
-        }), 500
-
-
-
 
 
 #------------------------------------------------------------------------------
-# SECTION 3: CRISIS SUPPORT RELATED CODE
+# CRISIS SUPPORT RELATED CODE
 #------------------------------------------------------------------------------
 
 # Crisis detection keywords - grouped by category for better maintainability
@@ -554,51 +312,6 @@ CRISIS_KEYWORDS = {
                r'\bcan\'t go on\b', r'\bwant to end it\b', r'\bgive up\b']
 }
 
-# India-specific Crisis resources
-INDIA_CRISIS_RESOURCES = {
-    'emergency_services': {
-        'number': '112',
-        'description': 'National Emergency Number for immediate emergencies'
-    },
-    'crisis_hotlines': [
-        {
-            'name': 'AASRA',
-            'number': '91-9820466726',
-            'description': '24/7 crisis support and suicide prevention',
-            'website': 'http://www.aasra.info/'
-        },
-        {
-            'name': 'Vandrevala Foundation',
-            'number': '1860-2662-345 / 1800-2333-330',
-            'description': '24/7 helpline for mental health emergencies',
-            'website': 'https://www.vandrevalafoundation.com/'
-        },
-        {
-            'name': 'NIMHANS Psychosocial Support Helpline',
-            'number': '080-46110007',
-            'description': 'Mental health support and counseling',
-            'website': 'https://nimhans.ac.in/'
-        },
-        {
-            'name': 'iCall Helpline',
-            'number': '022-25521111',
-            'description': 'Psychosocial helpline (Mon-Sat, 8 AM to 10 PM)',
-            'website': 'https://icallhelpline.org/'
-        }
-    ],
-    'online_resources': [
-        {
-            'name': 'The Live Love Laugh Foundation',
-            'website': 'https://www.thelivelovelaughfoundation.org/',
-            'description': 'Mental health resources and support'
-        },
-        {
-            'name': 'YourDost',
-            'website': 'https://yourdost.com/',
-            'description': 'Online counseling and emotional wellness platform'
-        }
-    ]
-}
 
 # Crisis response templates - centralized for easier maintenance
 CRISIS_RESPONSES = {
@@ -658,7 +371,7 @@ def generate_crisis_response(message):
     return CRISIS_RESPONSES.get(category, CRISIS_RESPONSES['general'])
 
 
-# Crisis contact information stored directly in the file
+# Crisis contact information - structured by category
 CRISIS_CONTACTS = [
     {
         'id': 'emergency_112',
@@ -713,5 +426,25 @@ CRISIS_CONTACTS = [
         'availability': 'Mon-Sat, 8 AM to 10 PM',
         'country': 'India',
         'priority': 5
+    },
+    {
+        'id': 'lll_foundation',
+        'type': 'online_resource',
+        'name': 'The Live Love Laugh Foundation',
+        'website': 'https://www.thelivelovelaughfoundation.org/',
+        'description': 'Mental health resources and support',
+        'availability': 'Online',
+        'country': 'India',
+        'priority': 6
+    },
+    {
+        'id': 'yourdost',
+        'type': 'online_resource',
+        'name': 'YourDost',
+        'website': 'https://yourdost.com/',
+        'description': 'Online counseling and emotional wellness platform',
+        'availability': 'Online',
+        'country': 'India',
+        'priority': 6
     }
 ]
