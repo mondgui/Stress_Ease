@@ -6,9 +6,9 @@ from config import Config
 # Validate configuration before starting the application
 try:
     Config.validate_config()
-    print("✓ Configuration validation passed")
+    print("[PASS] Configuration validation passed")
 except ValueError as e:
-    print(f"✗ Configuration error: {e}")
+    print(f"[ERROR] Configuration error: {e}")
     exit(1)
 
 # Create the Flask application instance
