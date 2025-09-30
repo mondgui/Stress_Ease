@@ -36,8 +36,9 @@ Base prefix for feature routes: /api
 
 ### Chat (/api/chat)
 - POST /message — send a message (creates session implicitly if session_id is null)
-- POST /summarize — generate session summary and cleanup
-- GET /crisis-resources — helplines and resources
+  - Includes integrated crisis detection with immediate support resources
+- POST /end-session — end chat session and cleanup resources
+- GET /crisis-contacts — helplines and emergency resources
 
 **Note:** Chat session listing, details, and deletion are handled directly by the Android app interacting with Firebase Firestore for better performance and real-time updates.
 
@@ -59,3 +60,4 @@ The Android app handles:
 - Keep your service account JSON and API keys out of version control.
 - Configure Firestore rules for production to ensure users can only access their own data.
 - For production, use a WSGI server (e.g., Gunicorn) and HTTPS.
+- Crisis detection is integrated directly into the message endpoint for immediate support.
