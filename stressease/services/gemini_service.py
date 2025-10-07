@@ -11,7 +11,6 @@ model = None
 # Global in-memory session cache for active conversations
 active_chat_sessions = {}
 
-
 #------------------------------------------------------------------------------
 # Initialization and Utility Functions
 #------------------------------------------------------------------------------
@@ -24,8 +23,8 @@ def init_gemini(api_key: str):
         # Configure Gemini with API key
         genai.configure(api_key=api_key)
         
-        # Initialize the model (using gemini-pro for text generation)
-        model = genai.GenerativeModel('gemini-pro')
+        # Initialize the model 
+        model = genai.GenerativeModel('gemini-2.0-flash-lite')
         
         print("Google Gemini AI initialized successfully")
         
@@ -51,11 +50,11 @@ def validate_gemini_response(response: str) -> Optional[str]:
     
     response_lower = response.lower()
     
-    # Check for crisis-related content
+    # Check for crisis-related content in AI response
     crisis_keywords = ['suicide', 'self-harm', 'kill yourself', 'end it all', 'hurt myself', 'die']
     for keyword in crisis_keywords:
         if keyword in response_lower:
-            return """I notice you're mentioning something serious. If you're experiencing a crisis, please reach out to a professional immediately. The National Suicide Prevention Lifeline is available 24/7 at 988 or 1-800-273-8255. Would you like me to provide more resources that might help?"""
+            return """I notice this is a serious topic. If you're experiencing a Crisis, please tap the red 'SOS' button in the chat to connect with professional Crisis resources immediately. How can I support you right now?"""
     
     # Check for diagnosis language violations
     diagnosis_patterns = [
@@ -80,6 +79,107 @@ def validate_gemini_response(response: str) -> Optional[str]:
             return """I'm here to provide emotional support, but I can't recommend specific treatments or medications. A healthcare professional would be the best person to discuss treatment options with you. Is there something else on your mind that you'd like to talk about?"""
     
     return response
+
+
+def find_crisis_resources(country: str) -> Optional[Dict[str, Any]]:
+    """
+    Generate country-specific Crisis resources using Gemini AI.
+    
+    Args:
+        country (str): Country code or name to find resources for
+        
+    Returns:
+        dict: Structured crisis resources for the specified country, or None if generation fails
+    """
+    if model is None:
+        raise RuntimeError("Gemini AI has not been initialized. Call init_gemini() first.")
+    
+    try:
+        # Normalize country input
+        country_input = country.strip()
+        
+        # Build prompt for Gemini
+        prompt = f"""
+Generate a comprehensive list of mental health Crisis resources for {country_input}.
+
+The response MUST be in valid JSON format with the following structure:
+{{
+  "emergency_services": {{
+    "number": "string",  // Primary emergency number
+    "description": "string"  // Brief description without any backticks or markdown
+  }},
+  "crisis_hotlines": [
+    {{
+      "name": "string",  // Organization name
+      "number": "string",  // Phone number with country code
+      "description": "string",  // Brief description of services without any backticks or markdown
+      "website": "string"  // Website URL without any backticks or markdown
+    }}
+  ],
+  "online_resources": [
+    {{
+      "name": "string",  // Organization name
+      "description": "string",  // Brief description of services
+      "website": "string"  // Website URL
+    }}
+  ]
+}}
+
+Include ONLY verified, legitimate resources. Include at least one emergency service, 2-5 crisis hotlines, and 2-5 online resources.
+Ensure all phone numbers include the country code. Provide accurate, up-to-date information.
+"""
+        
+        # Generate response from Gemini
+        response = model.generate_content(prompt)
+        response_text = response.text
+        
+        # Extract JSON from response
+        try:
+            # First try direct JSON parsing
+            resources = json.loads(response_text)
+        except json.JSONDecodeError:
+            # If that fails, try to extract JSON using regex
+            import re
+            json_match = re.search(r'({[\s\S]*})', response_text)
+            if not json_match:
+                print(f"Error: No JSON found in Gemini response for country {country}")
+                return None
+                
+            try:
+                json_str = json_match.group(1)
+                resources = json.loads(json_str)
+            except (json.JSONDecodeError, IndexError) as e:
+                print(f"Error: Failed to parse extracted JSON for country {country}: {str(e)}")
+                return None
+        
+        # Validate the structure
+        if not isinstance(resources, dict):
+            print(f"Error: Gemini response is not a dictionary for country {country}")
+            return None
+            
+        # Ensure required fields are present
+        if 'emergency_services' not in resources or 'crisis_hotlines' not in resources or 'online_resources' not in resources:
+            print(f"Error: Missing required fields in Gemini response for country {country}")
+            return None
+        
+        # Clean up website URLs - remove backticks and markdown formatting
+        if 'crisis_hotlines' in resources:
+            for hotline in resources['crisis_hotlines']:
+                if 'website' in hotline:
+                    # Remove backticks and extra spaces
+                    hotline['website'] = hotline['website'].replace('`', '').strip()
+        
+        if 'online_resources' in resources:
+            for resource in resources['online_resources']:
+                if 'website' in resource:
+                    # Remove backticks and extra spaces
+                    resource['website'] = resource['website'].replace('`', '').strip()
+            
+        return resources
+        
+    except Exception as e:
+        print(f"Error generating crisis resources for {country}: {str(e)}")
+        return None
 
 
 #------------------------------------------------------------------------------
@@ -116,8 +216,27 @@ You are NOT a licensed therapist, psychologist, psychiatrist, or medical profess
 Your role is that of a supportive peer and emotional companion.
 
 CRISIS INTERVENTION PROTOCOL:
-If a user expresses thoughts of self-harm, suicide, or mentions being in immediate danger, you must immediately and gently pivot the conversation to recommend professional help. Your response should include: 'It sounds like you are going through a lot right now, and it's brave of you to share that. For immediate support, I strongly encourage you to connect with a crisis hotline or mental health professional. You can access crisis resources through the app's crisis support section.'
+Tool Awareness: You must be aware that the user has a visible red 'SOS' button on their chat screen. This button gives them immediate access to a list of professional crisis helplines for their country.
 
+Severity Detection Guidelines:
+1. HIGH SEVERITY (Immediate Danger): Explicit mentions of current suicidal intent, active self-harm, specific suicide plans, or statements indicating imminent harm to self or others. Examples: "I'm going to end it all tonight", "I have the pills right here", "I can't take it anymore and have my plan ready".
+2. MEDIUM SEVERITY (Acute Distress): Expressions of suicidal ideation without specific plans, severe hopelessness, or statements suggesting the person is in a mental health crisis. Examples: "I don't see a point in living", "Everyone would be better off without me", "I keep thinking about hurting myself".
+3. LOW SEVERITY (Concerning Language): General expressions of despair, feeling overwhelmed, or vague references to not wanting to continue. Examples: "I don't know how much longer I can do this", "Nothing matters anymore".
+
+Action Protocol Based on Severity:
+- For HIGH SEVERITY: Respond with urgency and clarity. Your response must:
+  Part 1 (Brief Validation): "I'm deeply concerned about what you're sharing right now, and your safety is the absolute priority."
+  Part 2 (Direct Intervention): "Please immediately tap the red 'SOS' button on your screen to connect with crisis professionals who can help you right now. This is an emergency situation that requires immediate professional support."
+
+- For MEDIUM SEVERITY: Respond with serious concern:
+  Part 1 (Empathetic Validation): "What you're going through sounds incredibly painful, and I'm genuinely concerned about your wellbeing right now."
+  Part 2 (Strong Redirection): "I strongly encourage you to tap the red 'SOS' button on your screen to speak with trained professionals who can provide the support you need during this difficult time."
+
+- For LOW SEVERITY: Respond with care:
+  Part 1 (Supportive Validation): "It sounds like you're going through a really tough time, and I'm sorry you're experiencing this pain."
+  Part 2 (Gentle Guidance): "If these feelings are overwhelming, please consider tapping the red 'SOS' button to connect with supportive resources that can help."
+
+CRITICAL: Always err on the side of caution. If you're uncertain about the severity level, respond as if it were a higher severity situation. Never minimize or downplay concerning language.
 CONVERSATION STYLE:
 - Keep responses concise and digestible (2-4 sentences maximum)
 - Be genuinely curious about the user's experience
@@ -193,183 +312,6 @@ def generate_chat_response(chat_session, new_message: str) -> Optional[str]:
     except Exception as e:
         print(f"Error generating chat response with Gemini: {str(e)}")
         return "I'm having trouble connecting right now. Could we try again in a moment?"
-
-
-def generate_chat_title(transcript: str) -> Optional[str]:
-    """
-    Create a short, descriptive title for a chat session.
-    
-    Args:
-        transcript: The full conversation transcript as a string
-    
-    Returns:
-        A short title (3-5 words) or None if error occurs
-    """
-    if model is None:
-        raise RuntimeError("Gemini AI has not been initialized. Call init_gemini() first.")
-    
-    try:
-        # Build specific prompt for title generation
-        prompt = f"""Read this conversation and generate a short, descriptive title (3-5 words max). 
-Examples: 'Struggling with Work Stress', 'A Positive Day', 'Managing Anxiety Today', 'Family Relationship Issues'.
-Respond with only the title, no quotes or additional text.
-
-Conversation:
-{transcript}
-
-Title:"""
-
-        # Generate title with focused configuration
-        generation_config = {
-            "max_output_tokens": 20,   # Very short response
-            "temperature": 0.3,        # More focused/consistent
-            "top_p": 0.8,             # Less randomness
-            "top_k": 20               # Fewer token choices
-        }
-        
-        response = model.generate_content(
-            prompt,
-            generation_config=generation_config
-        )
-        
-        title = response.text.strip()
-        
-        # Basic validation - ensure it's not too long and remove quotes if present
-        if len(title) > 50:  # Fallback if too long
-            title = title[:47] + "..."
-        
-        # Remove quotes if AI added them
-        title = title.strip('"\'')
-        
-        return title if title else "Chat Session"
-        
-    except Exception as e:
-        print(f"Error generating chat title: {str(e)}")
-        return "Chat Session"
-
-
-def _build_chat_response_prompt(user_message: str, chat_history: List[Dict[str, str]], user_context: Optional[Dict[str, Any]] = None) -> str:
-    """Build a prompt for generating contextual chat responses."""
-    prompt = """
-CORE IDENTITY:
-You are StressBot, an AI companion from the StressEase app. Your primary purpose is to provide a supportive, non-judgmental space for users to express their feelings.
-
-TONE AND LANGUAGE:
-Your tone must always be warm, patient, and empathetic. Use simple, clear language. Avoid clinical jargon. Validate the user's feelings first (e.g., 'That sounds really tough,' or 'It makes sense that you feel that way') before offering gentle guidance.
-
-CRITICAL SAFETY BOUNDARY:
-You are NOT a licensed therapist or a medical professional. You are strictly forbidden from diagnosing any condition, prescribing medication, or giving medical advice. Your role is that of a supportive peer.
-
-CRISIS INTERVENTION PROTOCOL:
-If a user expresses thoughts of self-harm or mentions being in a crisis, you must immediately and gently pivot the conversation to recommend professional help. Your response in this case should be a variation of: 'It sounds like you are going through a lot right now, and it's brave of you to share that. For immediate support, I strongly encourage you to connect with a crisis hotline or a mental health professional.' You will then provide the resources.
-
-BREVITY AND ENGAGEMENT:
-Keep your responses concise and easy to digest. Aim for 2-4 sentences.
-To encourage the user to reflect and share more, end your responses with a gentle, open-ended question when appropriate. For example, instead of 'Did you have a bad day?', ask 'What was on your mind today?'
-
-PRACTICAL GUIDANCE:
-- Provide practical coping strategies and mental health tips when appropriate
-- Encourage professional help when needed
-- Use a conversational, supportive tone
-"""
-    
-    # Add user context if available
-    if user_context:
-        prompt += "\nUSER CONTEXT:\n"
-        if 'name' in user_context:
-            prompt += f"- Name: {user_context['name']}\n"
-        if 'age' in user_context:
-            prompt += f"- Age: {user_context['age']}\n"
-        if 'health_conditions' in user_context:
-            prompt += f"- Health conditions: {user_context['health_conditions']}\n"
-        if 'stress_triggers' in user_context:
-            prompt += f"- Known stress triggers: {user_context['stress_triggers']}\n"
-        if 'goals' in user_context:
-            prompt += f"- Personal goals: {user_context['goals']}\n"
-    
-    # Add chat history for context
-    if chat_history:
-        prompt += "\nCONVERSATION HISTORY:\n"
-        for message in chat_history[-5:]:  # Include last 5 messages for context
-            role = message.get('role', 'user')
-            content = message.get('content', '')
-            prompt += f"{role.capitalize()}: {content}\n"
-    
-    prompt += f"\nUSER'S CURRENT MESSAGE: {user_message}\n\n"
-    prompt += "Please provide a supportive and helpful response:"
-    
-    return prompt
-
-
-def summarize_conversation(transcript: str) -> Optional[str]:
-    """
-    Generate a detailed summary of a conversation using Gemini AI.
-    
-    Args:
-        transcript: The full conversation transcript as a string
-    
-    Returns:
-        A detailed paragraph summary or None if error occurs
-    """
-    if model is None:
-        raise RuntimeError("Gemini AI has not been initialized. Call init_gemini() first.")
-    
-    try:
-        # Build specific prompt for detailed summarization
-        prompt = f"""Summarize this mental health conversation. Detail the key topics, the user's primary emotions, and any strategies that were discussed.
-
-Provide a comprehensive paragraph that captures:
-- Main concerns or issues the user shared
-- Emotional state and progression throughout the conversation
-- Coping strategies, advice, or insights that were discussed
-- Overall tone and outcome of the conversation
-
-Conversation:
-{transcript}
-
-Summary:"""
-
-        # Generate summary with appropriate configuration
-        generation_config = {
-            "max_output_tokens": 300,  # Allow for detailed summary
-            "temperature": 0.5,        # Balanced creativity for good summarization
-            "top_p": 0.9,             # Good token diversity
-            "top_k": 40               # Reasonable variety
-        }
-        
-        response = model.generate_content(
-            prompt,
-            generation_config=generation_config
-        )
-        
-        return response.text.strip()
-        
-    except Exception as e:
-        print(f"Error summarizing conversation with Gemini: {str(e)}")
-        return None
-
-
-def _build_summarization_prompt(chat_messages: List[Dict[str, str]]) -> str:
-    """Build a prompt for conversation summarization."""
-    prompt = """You are tasked with summarizing a mental health support conversation from the StressEase app. Create a concise summary that captures:
-
-1. Main topics discussed
-2. User's primary concerns or emotions
-3. Key advice or strategies provided
-4. Overall tone and progression of the conversation
-
-CONVERSATION TO SUMMARIZE:
-"""
-    
-    for message in chat_messages:
-        role = message.get('role', 'user')
-        content = message.get('content', '')
-        prompt += f"{role.capitalize()}: {content}\n"
-    
-    prompt += """
-Please provide a summary in 2-3 sentences that would be useful for future reference. Focus on the most important aspects of the conversation."""
-    
-    return prompt
 
 
 #------------------------------------------------------------------------------

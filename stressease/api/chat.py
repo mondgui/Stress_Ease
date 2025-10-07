@@ -3,41 +3,88 @@
 from flask import Blueprint, request, jsonify
 from stressease.services.auth_service import token_required
 from stressease.services.gemini_service import (
-    generate_chat_response, validate_gemini_response,
-    start_chat_session
+    generate_chat_response, start_chat_session, find_crisis_resources
+)
+from stressease.services.firebase_service import (
+    get_cached_crisis_resources, cache_crisis_resources
 )
 from datetime import datetime
 import uuid
-import re
 
 # Create the chat blueprint
 chat_bp = Blueprint('chat', __name__)
 
 #------------------------------------------------------------------------------
-# CRISIS SUPPORT ENDPOINT
+# CRISIS SUPPORT ENDPOINTS
 #------------------------------------------------------------------------------
-@chat_bp.route('/crisis-contacts', methods=['GET'])
+
+
+@chat_bp.route('/crisis-resources', methods=['GET' , 'POST'])
 @token_required
-def get_crisis_contacts(user_id):
+def get_crisis_resources(user_id):
     """
-    Endpoint for getting crisis support contact information.
-    Triggered when user clicks the "Help/Crisis Support" button in the app.
+    Endpoint for getting country-specific Crisis resources.
+    Triggered when user selects a country from dropdown in the SOS section.
+    
+    Query Parameters:
+        country (str): Country name selected from dropdown
     
     Returns:
-        JSON response with crisis contact information
+        JSON response with country-specific crisis resources
     """
     try:
-        return jsonify({
+        # Get country from query parameter - Android app sends from dropdown
+        country = request.args.get('country', '').strip()
+        
+        # Set default country if somehow not provided (fallback only)
+        if not country:
+            country = 'India'
+        
+        # Step 1: Check cache first
+        cached_resources = get_cached_crisis_resources(country)
+        
+        # Step 2: Cache hit - return cached resources
+        if cached_resources:
+            response = jsonify({
+                'success': True,
+                'message': 'Crisis resources retrieved from cache',
+                'resources': cached_resources,
+                'source': 'cache'
+            })
+            response.headers['Content-Type'] = 'application/json; charset=utf-8'
+            return response, 200
+        
+        # Step 3: Cache miss - generate new resources using Gemini
+        resources = find_crisis_resources(country)
+        if not resources:
+            response = jsonify({
+                'success': False,
+                'message': f'Could not find Crisis resources for {country}'
+            })
+            response.headers['Content-Type'] = 'application/json; charset=utf-8'
+            return response, 404
+        
+        # Step 4: Cache the new resources in Firebase
+        cache_success = cache_crisis_resources(country, resources)
+        
+        # Step 5: Return the resources
+        response = jsonify({
             'success': True,
-            'message': 'Crisis support contacts retrieved successfully',
-            'contacts': CRISIS_CONTACTS
-        }), 200
+            'message': 'Crisis resources generated using AI',
+            'resources': resources,
+            'source': 'generated',
+            'cached': cache_success
+        })
+        response.headers['Content-Type'] = 'application/json; charset=utf-8'
+        return response, 200
+        
     except Exception as e:
-        return jsonify({
+        response = jsonify({
             'success': False,
-            'error': 'Failed to retrieve crisis contacts',
-            'message': str(e)
-        }), 500
+            'message': f'Error retrieving crisis resources: {str(e)}'
+        })
+        response.headers['Content-Type'] = 'application/json; charset=utf-8'
+        return response, 500
 
 
 # Dictionary to store active chat sessions
@@ -95,9 +142,6 @@ def send_chat_message(user_id):
         # Create timestamp once for efficiency
         timestamp = datetime.utcnow().isoformat()
         
-        # Simple crisis detection - returns tuple (is_crisis, category)
-        is_crisis, crisis_category = detect_crisis_message(user_message)
-        
         # Get or create session
         session_id, chat_session = _get_or_create_session(session_id)
         if not chat_session:
@@ -107,52 +151,24 @@ def send_chat_message(user_id):
                 'message': 'Chat session has expired or does not exist'
             }), 404
         
-        # Generate appropriate response based on crisis detection
-        if is_crisis:
-            # Generate compassionate crisis response
-            ai_response = generate_crisis_response(user_message)
-            
-            # Return response with crisis contacts
-            return jsonify({
-                'success': True,
-                'user_message': {
-                    'content': user_message,
-                    'timestamp': timestamp,
-                    'role': 'user'
-                },
-                'ai_response': {
-                    'content': ai_response,
-                    'timestamp': timestamp,
-                    'role': 'assistant'
-                },
-                'session_id': session_id,
-                'crisis_detected': True,
-                'crisis_category': crisis_category,
-                'crisis_resources': CRISIS_CONTACTS
-            }), 201
-        else:
-            # Generate normal AI response with validation
-            ai_response = generate_chat_response(chat_session, user_message)
-            
-            # Validate AI response
-            if not validate_gemini_response(ai_response):
-                ai_response = "I apologize, but I'm having trouble generating a proper response right now. Could you please rephrase your message?"
-            
-            # Return standard response structure
-            return jsonify({
-                'success': True,
-                'user_message': {
-                    'content': user_message,
-                    'timestamp': timestamp,
-                    'role': 'user'
-                },
-                'ai_response': {
-                    'content': ai_response,
-                    'timestamp': timestamp,
-                    'role': 'assistant'
-                },
-                'session_id': session_id
-            }), 201
+        # Generate AI response (validation is already done inside generate_chat_response)
+        ai_response = generate_chat_response(chat_session, user_message)
+        
+        # Return standard response structure
+        return jsonify({
+            'success': True,
+            'user_message': {
+                'content': user_message,
+                'timestamp': timestamp,
+                'role': 'user'
+            },
+            'ai_response': {
+                'content': ai_response,
+                'timestamp': timestamp,
+                'role': 'assistant'
+            },
+            'session_id': session_id
+        }), 201
         
     except Exception as e:
         return jsonify({
@@ -190,50 +206,6 @@ def _get_or_create_session(session_id):
     except Exception:
         return None, None
 
-
-def _format_crisis_resources(crisis_contacts):
-    """
-    Convert database crisis contacts to expected API format.
-    
-    Args:
-        crisis_contacts (list): List of crisis contacts from database
-        
-    Returns:
-        dict: Formatted crisis resources
-    """
-    formatted = {
-        'emergency_services': {},
-        'crisis_hotlines': [],
-        'online_resources': []
-    }
-    
-    for contact in crisis_contacts:
-        contact_type = contact.get('type', 'online_resource')
-        
-        if contact_type == 'emergency':
-            formatted['emergency_services'] = {
-                'number': contact.get('number'),
-                'description': contact.get('description')
-            }
-        elif contact_type == 'crisis_hotline':
-            hotline = {
-                'name': contact.get('name'),
-                'number': contact.get('number'),
-                'description': contact.get('description')
-            }
-            if contact.get('website'):
-                hotline['website'] = contact.get('website')
-            formatted['crisis_hotlines'].append(hotline)
-        else:
-            resource = {
-                'name': contact.get('name'),
-                'description': contact.get('description')
-            }
-            if contact.get('website'):
-                resource['website'] = contact.get('website')
-            formatted['online_resources'].append(resource)
-    
-    return formatted
 
 
 
@@ -282,7 +254,7 @@ def end_chat_session(user_id):
             del active_chat_sessions[session_id]
             cleanup_count += 1
             
-        # No need to clean up crisis resources tracking anymore
+        # No need to clean up Crisis resources tracking anymore
             
         return jsonify({
             'success': True,
@@ -297,154 +269,3 @@ def end_chat_session(user_id):
             'message': str(e)
         }), 500
 
-
-
-
-#------------------------------------------------------------------------------
-# CRISIS SUPPORT RELATED CODE
-#------------------------------------------------------------------------------
-
-# Crisis detection keywords - grouped by category for better maintainability
-CRISIS_KEYWORDS = {
-    'suicide': [r'\bsuicide\b', r'\bkill myself\b', r'\bend my life\b', r'\bwant to die\b'],
-    'self_harm': [r'\bharming myself\b', r'\bself-harm\b', r'\bself harm\b', r'\bhurt myself\b'],
-    'general': [r'\bemergency\b', r'\bhelp me\b', r'\bhopeless\b', r'\bno reason to live\b',
-               r'\bcan\'t go on\b', r'\bwant to end it\b', r'\bgive up\b']
-}
-
-
-# Crisis response templates - centralized for easier maintenance
-CRISIS_RESPONSES = {
-    'suicide': ("I'm deeply concerned about what you're sharing. Your life matters, and these feelings, " 
-               "while overwhelming, can be addressed with proper support. Please know that help is available, " 
-               "and many people have overcome similar feelings with professional assistance. " 
-               "Would you be willing to reach out to a Crisis helpline right now?"),
-    
-    'self_harm': ("I understand you're in a lot of pain right now. Self-harm is often a way to cope with " 
-                 "emotional distress, but there are healthier alternatives that can help. Professional support " 
-                 "can provide immediate relief and long-term strategies. Your wellbeing matters, and " 
-                 "recovery is possible with the right help."),
-    
-    'general': ("I'm concerned about what you're sharing and want you to know that support is available. " 
-               "While I'm here to listen, connecting with mental health professionals can provide the " 
-               "specialized help you deserve. You don't have to face these feelings alone, and " 
-               "reaching out is a sign of strength, not weakness.")
-}
-
-def detect_crisis_message(message):
-    """
-    Detect if a message contains Crisis-related keywords.
-    
-    Args:
-        message (str): The user message to check
-        
-    Returns:
-        tuple: (bool, str) - (is_crisis, category)
-    """
-    message = message.lower()
-    
-    # Check each category of keywords
-    for category, patterns in CRISIS_KEYWORDS.items():
-        for pattern in patterns:
-            if re.search(pattern, message):
-                return True, category
-    
-    return False, None
-
-def generate_crisis_response(message):
-    """
-    Generate a supportive response for Crisis messages.
-    
-    Args:
-        message (str): The user's crisis message
-        
-    Returns:
-        str: A supportive response
-    """
-    # Detect the specific Crisis category
-    is_crisis, category = detect_crisis_message(message)
-    
-    if not is_crisis:
-        return CRISIS_RESPONSES['general']
-    
-    # Return the appropriate response based on the category
-    return CRISIS_RESPONSES.get(category, CRISIS_RESPONSES['general'])
-
-
-# Crisis contact information - structured by category
-CRISIS_CONTACTS = [
-    {
-        'id': 'emergency_112',
-        'type': 'emergency',
-        'name': 'National Emergency Number',
-        'number': '112',
-        'description': 'National Emergency Number for immediate emergencies',
-        'availability': '24/7',
-        'country': 'India',
-        'priority': 1
-    },
-    {
-        'id': 'aasra',
-        'type': 'crisis_hotline',
-        'name': 'AASRA',
-        'number': '91-9820466726',
-        'description': '24/7 crisis support and suicide prevention',
-        'website': 'http://www.aasra.info/',
-        'availability': '24/7',
-        'country': 'India',
-        'priority': 2
-    },
-    {
-        'id': 'vandrevala',
-        'type': 'crisis_hotline',
-        'name': 'Vandrevala Foundation',
-        'number': '1860-2662-345 / 1800-2333-330',
-        'description': '24/7 helpline for mental health emergencies',
-        'website': 'https://www.vandrevalafoundation.com/',
-        'availability': '24/7',
-        'country': 'India',
-        'priority': 3
-    },
-    {
-        'id': 'nimhans',
-        'type': 'crisis_hotline',
-        'name': 'NIMHANS Psychosocial Support Helpline',
-        'number': '080-46110007',
-        'description': 'Mental health support and counseling',
-        'website': 'https://nimhans.ac.in/',
-        'availability': 'Business hours',
-        'country': 'India',
-        'priority': 4
-    },
-    {
-        'id': 'icall',
-        'type': 'crisis_hotline',
-        'name': 'iCall Helpline',
-        'number': '022-25521111',
-        'description': 'Psychosocial helpline (Mon-Sat, 8 AM to 10 PM)',
-        'website': 'https://icallhelpline.org/',
-        'availability': 'Mon-Sat, 8 AM to 10 PM',
-        'country': 'India',
-        'priority': 5
-    },
-    {
-        'id': 'lll_foundation',
-        'type': 'online_resource',
-        'name': 'The Live Love Laugh Foundation',
-        'website': 'https://www.thelivelovelaughfoundation.org/',
-        'description': 'Mental health resources and support',
-        'availability': 'Online',
-        'country': 'India',
-        'priority': 6
-    },
-    {
-        'id': 'yourdost',
-        'type': 'online_resource',
-        'name': 'YourDost',
-        'website': 'https://yourdost.com/',
-        'description': 'Online counseling and emotional wellness platform',
-        'availability': 'Online',
-        'country': 'India',
-        'priority': 6
-    }
-]

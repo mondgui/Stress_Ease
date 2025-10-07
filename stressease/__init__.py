@@ -41,6 +41,18 @@ def create_app():
     app.register_blueprint(mood_bp, url_prefix='/api/mood')
     app.register_blueprint(chat_bp, url_prefix='/api/chat')
     
+    # Add debug tools in development mode only
+    if app.config.get('ENV') == 'development' or app.config.get('DEBUG', False):
+        try:
+            from stressease.debug_tools import init_debug_tools
+            from stressease.api.chat import active_chat_sessions
+            
+            # Initialize debug tools with reference to active sessions
+            init_debug_tools(app, active_chat_sessions)
+            print("✓ Debug tools initialized (DEVELOPMENT ONLY)")
+        except Exception as e:
+            print(f"✗ Debug tools initialization error: {e}")
+    
     # Global error handlers
     @app.errorhandler(400)
     def bad_request(error):

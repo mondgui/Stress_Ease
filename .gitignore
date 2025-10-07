@@ -32,6 +32,9 @@ Thumbs.db
 # Flask instance folder
 instance/
 
+# Debug tools (local development only)
+stressease/debug_tools.py
+
 # Distribution / packaging
 .Python
 build/
