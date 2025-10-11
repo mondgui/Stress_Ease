@@ -87,7 +87,8 @@ def get_crisis_resources(user_id):
         return response, 500
 
 
-# Dictionary to store active chat sessions
+# Dictionary to store active chat sessions by user_id
+# Format: {user_id: {session_id: chat_session}}
 active_chat_sessions = {}
 
 
@@ -142,8 +143,8 @@ def send_chat_message(user_id):
         # Create timestamp once for efficiency
         timestamp = datetime.utcnow().isoformat()
         
-        # Get or create session
-        session_id, chat_session = _get_or_create_session(session_id)
+        # Get or create session with user_id to maintain context
+        session_id, chat_session = _get_or_create_session(session_id, user_id)
         if not chat_session:
             return jsonify({
                 'success': False,
@@ -178,29 +179,43 @@ def send_chat_message(user_id):
         }), 500
 
 
-def _get_or_create_session(session_id):
+def _get_or_create_session(session_id, user_id):
     """
     Optimized helper function to get existing session or create new one.
+    Sessions are now associated with user_id to maintain context.
     
     Args:
         session_id (str): Session ID or None
+        user_id (str): User ID from authentication
         
     Returns:
         tuple: (session_id, chat_session) or (None, None) if failed
     """
     try:
+        # Initialize user's session dictionary if it doesn't exist
+        if user_id not in active_chat_sessions:
+            active_chat_sessions[user_id] = {}
+        
+        # If no session_id provided, check if user has any active sessions
         if not session_id:
-            # Create new session
+            # If user has active sessions, use the most recent one
+            if active_chat_sessions[user_id]:
+                # Get the first session (assuming it's the most recent)
+                # In a production app, you might want to track timestamps
+                session_id = next(iter(active_chat_sessions[user_id]))
+                return session_id, active_chat_sessions[user_id][session_id]
+            
+            # No active sessions, create a new one
             session_id = str(uuid.uuid4())
             chat_session = start_chat_session({})
-            active_chat_sessions[session_id] = chat_session
+            active_chat_sessions[user_id][session_id] = chat_session
             return session_id, chat_session
         
-        # Check if session exists
-        if session_id in active_chat_sessions:
-            return session_id, active_chat_sessions[session_id]
+        # Check if the specific session exists for this user
+        if session_id in active_chat_sessions[user_id]:
+            return session_id, active_chat_sessions[user_id][session_id]
         
-        # Session not found
+        # Session not found for this user
         return None, None
         
     except Exception:
@@ -250,11 +265,10 @@ def end_chat_session(user_id):
         cleanup_count = 0
         
         # Clean up active session from memory cache
-        if session_id in active_chat_sessions:
-            del active_chat_sessions[session_id]
+        if user_id in active_chat_sessions and session_id in active_chat_sessions[user_id]:
+            del active_chat_sessions[user_id][session_id]
             cleanup_count += 1
             
-        # No need to clean up Crisis resources tracking anymore
             
         return jsonify({
             'success': True,
