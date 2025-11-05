@@ -29,10 +29,14 @@ Base prefix for feature routes: /api
 **Note:** User authentication and profile management are handled directly by the Android app using Firebase Authentication and Firestore. The Flask backend only handles mood tracking and chat functionality.
 
 ### Mood (/api/mood)
-- POST /log — submit quiz and store AI analysis
-- GET /history — recent mood entries
-- GET /trends?days=30 — basic stats over a period
-- GET /insights — quick tips based on recent history
+- POST `/quiz/daily` — submit structured 12-question daily mood quiz
+  - Body:
+    - `core_scores`: {`mood`, `energy`, `sleep`, `stress`} (1–5)
+    - `rotating_scores`: {`domain_name`: string, `scores`: [5 items, 1–5]}
+    - `dass_today`: {`depression`, `anxiety`, `stress`} (1–5)
+    - Optional: `date` (`YYYY-MM-DD`), `additional_notes`
+  - Computes daily averages, high/low point, stores to `user_mood_logs`.
+  - Auto-triggers weekly DASS aggregation after every 7 submissions and stores to `user_weekly_dass`.
 
 ### Chat (/api/chat)
 - POST /message — send a message (creates session implicitly if session_id is null)

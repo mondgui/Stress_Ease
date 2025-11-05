@@ -2,7 +2,7 @@
 
 import firebase_admin
 from firebase_admin import credentials, firestore
-from datetime import datetime
+from datetime import datetime, date
 from typing import Dict, List, Optional, Any, Union
 
 
@@ -52,89 +52,168 @@ def get_firestore_client():
     return db
 
 
-def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
+# (Removed legacy user profile and mood history helpers to focus on daily/weekly quiz logic)
+
+
+# -----------------------------------------------------------------------------
+# Mood Quiz (Daily & Weekly) Operations
+# -----------------------------------------------------------------------------
+def save_daily_mood_log(user_id: str, daily_log: Dict[str, Any]) -> Optional[str]:
     """
-    Get user profile data from Firestore.
-    
+    Save a structured daily mood quiz log to Firestore.
+
+    Collection: user_mood_logs
+
     Args:
-        user_id (str): The Firebase Auth user ID
-        
+        user_id (str): Firebase Auth user ID
+        daily_log (dict): Structured daily log payload
+
     Returns:
-        dict: User profile data, or None if not found
+        Optional[str]: Document ID if saved successfully, else None
     """
+    if db is None:
+        raise RuntimeError("Firebase has not been initialized. Call init_firebase() first.")
+
     try:
-        # Get user profile from users collection
-        doc_ref = db.collection('users').document(user_id)
-        doc = doc_ref.get()
-        
-        if doc.exists:
-            return doc.to_dict()
-        else:
-            return None
-            
+        daily_log['user_id'] = user_id
+        # Default date if not provided
+        if 'date' not in daily_log or not daily_log['date']:
+            daily_log['date'] = date.today().isoformat()
+        # Server-side timestamp
+        daily_log['submitted_at'] = datetime.utcnow()
+
+        doc_ref = db.collection('user_mood_logs').add(daily_log)
+        return doc_ref[1].id
     except Exception as e:
-        print(f"Error getting user profile for {user_id}: {str(e)}")
+        print(f"Error saving daily mood log for {user_id}: {str(e)}")
         return None
 
 
-# Mood Entry Operations
-def save_mood_log(user_id: str, mood_data: Dict[str, Any]) -> Optional[str]:
+def get_last_daily_mood_logs(user_id: str, limit: int = 7) -> List[Dict[str, Any]]:
     """
-    Save a mood log entry to Firestore.
-    
-    Args:
-        user_id (str): The Firebase Auth user ID
-        mood_data (dict): Mood log data including analysis results
-        
-    Returns:
-        str: Document ID of the saved mood entry, or None if failed
-    """
-    try:
-        # Add metadata
-        mood_data['user_id'] = user_id
-        mood_data['created_at'] = datetime.utcnow()
-        
-        # Save to mood_entries collection
-        doc_ref = db.collection('mood_entries').add(mood_data)
-        return doc_ref[1].id  # Return the document ID
-        
-    except Exception as e:
-        print(f"Error saving mood log for {user_id}: {str(e)}")
-        return None
+    Retrieve the most recent daily mood quiz logs for a user.
 
-
-def get_mood_history(user_id: str, limit: int = 30) -> List[Dict[str, Any]]:
-    """
-    Retrieve mood history for a user.
-    
     Args:
-        user_id (str): The Firebase Auth user ID
-        limit (int): Maximum number of entries to retrieve
-        
+        user_id (str): Firebase Auth user ID
+        limit (int): Number of entries to retrieve (default: 7)
+
     Returns:
-        list: List of mood entries, ordered by creation date (newest first)
+        List[Dict[str, Any]]: List of daily mood logs (newest first)
     """
+    if db is None:
+        raise RuntimeError("Firebase has not been initialized. Call init_firebase() first.")
+
     try:
-        mood_entries = []
-        
-        # Query mood entries for the user, ordered by creation date
-        query = (db.collection('mood_entries')
-                .where('user_id', '==', user_id)
-                .order_by('created_at', direction=firestore.Query.DESCENDING)
-                .limit(limit))
-        
+        logs = []
+        query = (
+            db.collection('user_mood_logs')
+              .where('user_id', '==', user_id)
+              .order_by('submitted_at', direction=firestore.Query.DESCENDING)
+              .limit(limit)
+        )
         docs = query.stream()
-        
         for doc in docs:
             entry = doc.to_dict()
             entry['id'] = doc.id
-            mood_entries.append(entry)
-        
-        return mood_entries
-        
+            logs.append(entry)
+        return logs
     except Exception as e:
-        print(f"Error retrieving mood history for {user_id}: {str(e)}")
+        print(f"Error retrieving last daily mood logs for {user_id}: {str(e)}")
         return []
+
+
+def get_daily_mood_logs_count(user_id: str) -> int:
+    """
+    Count total number of daily mood logs for a user.
+
+    Args:
+        user_id (str): Firebase Auth user ID
+
+    Returns:
+        int: Total count of documents in user_mood_logs for the user
+    """
+    if db is None:
+        raise RuntimeError("Firebase has not been initialized. Call init_firebase() first.")
+
+    try:
+        query = db.collection('user_mood_logs').where('user_id', '==', user_id)
+        count = 0
+        for _ in query.stream():
+            count += 1
+        return count
+    except Exception as e:
+        print(f"Error counting daily mood logs for {user_id}: {str(e)}")
+        return 0
+
+
+def weekly_dass_exists(user_id: str, week_start: str, week_end: str) -> bool:
+    """
+    Check if a weekly DASS record already exists for the given user and week.
+
+    Args:
+        user_id (str): Firebase Auth user ID
+        week_start (str): ISO date string for week start
+        week_end (str): ISO date string for week end
+
+    Returns:
+        bool: True if a record exists, False otherwise
+    """
+    if db is None:
+        raise RuntimeError("Firebase has not been initialized. Call init_firebase() first.")
+
+    try:
+        query = (
+            db.collection('user_weekly_dass')
+              .where('user_id', '==', user_id)
+              .where('week_start', '==', week_start)
+              .where('week_end', '==', week_end)
+        )
+        docs = query.stream()
+        for _ in docs:
+            return True
+        return False
+    except Exception as e:
+        print(f"Error checking weekly DASS existence for {user_id}: {str(e)}")
+        return False
+
+
+def save_weekly_dass_totals(user_id: str, week_start: str, week_end: str,
+                             depression_total: int, anxiety_total: int, stress_total: int) -> Optional[str]:
+    """
+    Save weekly DASS-21 totals to Firestore.
+
+    Collection: user_weekly_dass
+
+    Args:
+        user_id (str): Firebase Auth user ID
+        week_start (str): ISO date string for week start
+        week_end (str): ISO date string for week end
+        depression_total (int): Scaled total (DASS-21 x2)
+        anxiety_total (int): Scaled total (DASS-21 x2)
+        stress_total (int): Scaled total (DASS-21 x2)
+
+    Returns:
+        Optional[str]: Document ID if saved successfully, else None
+    """
+    if db is None:
+        raise RuntimeError("Firebase has not been initialized. Call init_firebase() first.")
+
+    try:
+        data = {
+            'user_id': user_id,
+            'week_start': week_start,
+            'week_end': week_end,
+            'depression_total': depression_total,
+            'anxiety_total': anxiety_total,
+            'stress_total': stress_total,
+            'calculated_at': datetime.utcnow(),
+        }
+
+        doc_ref = db.collection('user_weekly_dass').add(data)
+        return doc_ref[1].id
+    except Exception as e:
+        print(f"Error saving weekly DASS totals for {user_id}: {str(e)}")
+        return None
 
 
 def get_cached_crisis_resources(country: str) -> Optional[Dict[str, Any]]:

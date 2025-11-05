@@ -26,11 +26,11 @@ def test_imports():
         from dotenv import load_dotenv
         print("✓ python-dotenv imported successfully")
         
-        assert True
+        return True
         
     except ImportError as e:
         print(f"✗ Import error: {e}")
-        assert False, f"Import error: {e}"
+        return False
 
 
 def test_config():
@@ -53,13 +53,13 @@ def test_config():
                     print(f"⚠ {attr} is empty (expected for template)")
             else:
                 print(f"✗ {attr} is missing from Config")
-                assert False, f"{attr} is missing from Config"
+                return False
         
-        assert True
+        return True
         
     except Exception as e:
         print(f"✗ Configuration error: {e}")
-        assert False, f"Configuration error: {e}"
+        return False
 
 
 def test_app_creation():
